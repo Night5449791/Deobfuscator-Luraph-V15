@@ -8,14 +8,34 @@ import traceout as trace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_RERUNS = 12
-SPIN_CHECKS = 24    
+SPIN_CHECKS = 240   
+
+# The dispatch head, in both shapes Luraph uses:
+#   v15.0  while true do local m=M[j];
+#   v15.1  repeat local RH,PH=UcE[3][n];
+# The second one indexes a state table twice, which is why the plain
+# `NAME[NAME]` form below does not cover it. Without a match here the runtime never
+# calls __SPIN.f(), so it never heartbeats and the harness kills the process on its
+# stall timer while it is still working.
+# v15.1 also emits dispatch loops whose head is not an assignment at all --
+# `while true do if P<=5 then ...` (the flattened state machine that gF and the
+# opcode handlers use). Those were missed by the plain `NAME=NAME[NAME];` form,
+# which is why a 1.65 MB payload could spin for 15+ minutes with __SPIN.f()
+# never once called. The extra alternative covers it; the marker is spliced
+# right after the loop keyword, which is always syntactically valid.
+_SPIN_HEAD = re.compile(
+    r"(?:while true do|repeat) (?:local )?[A-Za-z_]+(?:,[A-Za-z_]+)*="
+    r"[A-Za-z_]+\[[^\]]+\]\[[A-Za-z_]+\];"
+    r"|(?:while true do|repeat) (?:local )?[A-Za-z_]+(?:,[A-Za-z_]+)*="
+    r"[A-Za-z_]+\[[A-Za-z_]+\];"
+)
 
 def patch_spin(src):
     """Spin watchdog (envlog's --cfg spin): every VM dispatch loop head counts
     steps in __SPIN.n and calls __SPIN.f() every __SPIN.step of them. Table
     operations only, plus that rare call (no locals: see patch_entries)."""
-    return re.sub(r"while true do (?:local )?[A-Za-z_]+(?:,[A-Za-z_]+)*=[A-Za-z_]+\[[A-Za-z_]+\];",
-                  lambda m: m.group(0) + "__SPIN.n=__SPIN.n+1;if __SPIN.n>=__SPIN.step then __SPIN.f()end;", src)
+    return _SPIN_HEAD.sub(
+        lambda m: m.group(0) + "__SPIN.n=__SPIN.n+1;if __SPIN.n>=__SPIN.step then __SPIN.f()end;", src)
 
 def patch_chunk(src, tmpdir):
     """Instrument a loadstring'd VM chunk like the main script."""
@@ -171,7 +191,10 @@ def run(job):
     for attempt in range(1, args.max_runs + 1):
 
         cfg = {"time_budget": args.budget, "dump_strings": args.strings, "executor": args.executor,
-               "skip_protos": skip}
+               "skip_protos": skip,
+               # a run that never prints cannot be traced: bound its silent phase
+               # so a payload stuck inside its own state machine fails fast
+               "stall": harness.silent_stall(args.timeout, args.budget)}
         if args.input_text is not None:
             cfg["input_text"] = args.input_text
         if args.no_fold:

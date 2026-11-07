@@ -164,7 +164,27 @@ def take_chunks(body):
 LAST_RAW = [""]     
 
 HEARTBEAT = 2       
-STALL = 20          
+# How long the luau process may print nothing before it is killed. The runtime emits a
+# heartbeat every HEARTBEAT seconds from `checkBudget`, which only runs when the script
+# touches the instrumented environment — a large VM spends long stretches inside pure
+# Luau bytecode between two such touches, and 20s was short enough that a v15.1 payload
+# (1.65 MB, ~500 opcode handlers) was killed while it was working. This is a
+# *stall* limit, not the run deadline: `--timeout` still bounds the whole run.
+STALL = 120         
+
+# A payload whose root call never leaves its own flattened state machine prints
+# nothing at all: no heartbeat and no trace. There is no progress to preserve
+# from such a run, so waiting out --timeout only burns the whole window. Give the
+# silent phase its own, much shorter bound (still generous enough for the
+# 1.65 MB blob decode, which is silent but linear) so the run fails with a
+# diagnosis inside the caller's 5-minute window.
+SILENT_STALL = 90
+
+def silent_stall(timeout, budget):
+    """Bound for a run that produced no output at all yet: never longer than the
+    whole run, and never shorter than the decode of a large protected blob."""
+    return max(60, min(SILENT_STALL, int(timeout * 0.5), int(budget) + 30))
+
 
 def _communicate(cmd, timeout, stall):
     """subprocess.run(capture_output=True) that also gives up when the process
@@ -205,9 +225,15 @@ def run_once(luau, source, cfg, hpath, timeout, keep, chunks=None):
     with open(hpath, "w", encoding="latin-1", newline="\n") as f:
         f.write(build_harness(source, cfg, chunks))
     try:
-        out, errb = _communicate([luau, hpath], timeout, STALL if cfg.get("heartbeat") else None)
+        out, errb = _communicate([luau, hpath], timeout, cfg.get("stall") or (STALL if cfg.get("heartbeat") else None))
     except subprocess.TimeoutExpired as e:
-        return None, "timed out after %ds (script is stuck in a loop the tracer cannot see)" % e.timeout
+        # A payload that never touches the instrumented environment prints
+        # nothing at all: no heartbeat, no \0ENVLOG-BEGIN, so the trace is empty
+        # and the only useful information is that the run died silently. Say so
+        # explicitly -- an empty error string made this look like a crash.
+        return None, ("gave up after %ds with no harness output at all: the script never reached an "
+                      "instrumented environment call, so no trace, heartbeat or budget check could run "
+                      "(pure-CPU loop inside the payload's own state machine)" % e.timeout)
     finally:
         if not keep and os.path.exists(hpath):
             os.remove(hpath)

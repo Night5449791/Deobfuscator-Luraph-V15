@@ -9,7 +9,7 @@ const trace = require('./traceout');
 const tidy = require('./tidy');
 const devirt = require('./devirt');
 
-const SPIN_CHECKS = 24;
+const SPIN_CHECKS = 240;
 
 function mapperFor(job) {
   return job.obfuscator && job.obfuscator.includes('v14') ? vmmap14 : vmmap;

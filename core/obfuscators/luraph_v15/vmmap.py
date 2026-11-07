@@ -47,15 +47,51 @@ def local_name(expr):
         return expr["local"]["name"]
     return None
 
+def _dispatch_arr(v):
+    """Names the opcode array read by `ARR[PC]`, or None if this is not such a read.
+
+    v15.0 reads a local directly (`m=M[j]`). v15.1 keeps the whole VM state in one
+    table captured as an upvalue, so the read is an index of an index
+    (`RH,PH=UcE[3][n]`). Accepting an index-of-local for `expr` covers both without
+    weakening the check: the inner index still has to be a plain local.
+    """
+    if not isinstance(v, dict) or v.get("type") != "AstExprIndexExpr":
+        return None
+
+    direct = local_name(v["expr"])
+    if direct:
+        return direct
+
+    # `T[<n>][<pc>]` -- the state table, holding the opcode array at a fixed slot
+    inner = v["expr"]
+    if inner.get("type") == "AstExprIndexExpr":
+        return local_name(inner["expr"])
+
+    return None
+
+def _is_dispatch_loop(n):
+    """`AstStatWhile` with a true condition, or `AstStatRepeat` with `until false`.
+
+    The `until true` repeats v15.1 sprinkles through its bit32 helpers are NOT
+    dispatch loops: they run once by construction, so the form matters.
+    """
+    t = n.get("type")
+    if t not in ("AstStatWhile", "AstStatRepeat"):
+        return False
+
+    cond = n.get("condition")
+    if not cond or cond.get("type") != "AstExprConstantBool":
+        return False
+
+    return cond["value"] is True if t == "AstStatWhile" else cond["value"] is False
+
 def find_dispatchers(root):
-    """while true do local op = ARR[PC]; if-tree ... end"""
+    """while true do local op = ARR[PC]; if-tree ... end
+    (or the v15.1 `repeat local op=STATE[n][PC]; ... until false`)"""
     found = []
 
     def visit(n):
-        if n.get("type") != "AstStatWhile":
-            return
-        cond = n["condition"]
-        if cond.get("type") != "AstExprConstantBool" or not cond.get("value"):
+        if not _is_dispatch_loop(n):
             return
         body = n["body"]["body"]
 
@@ -71,9 +107,8 @@ def find_dispatchers(root):
             if not opname:
                 return
         v = st["values"][0]
-        if v["type"] != "AstExprIndexExpr":
-            return
-        arr, pc = local_name(v["expr"]), local_name(v["index"])
+        arr = _dispatch_arr(v)
+        pc = local_name(v["index"]) if arr else None
         if not arr or not pc or body[1]["type"] != "AstStatIf":
             return
         found.append({"node": n, "op": opname, "arr": arr, "pc": pc, "tree": body[1],
@@ -249,7 +284,7 @@ def closure_entries(root):
         if isinstance(n, dict):
             if n.get("type") == "AstExprFunction":
                 stack = stack + [n]
-            if n.get("type") == "AstStatWhile" and any(n is d for d in disp_nodes):
+            if _is_dispatch_loop(n) and any(n is d for d in disp_nodes):
                 inner = next(f for f in reversed(stack) if f.get("vararg") and not f["args"])
                 outer = next(f for f in reversed(stack) if len(f["args"]) >= 2)
                 l1, c1, _, _ = loc(inner["body"]["body"][0])
@@ -278,7 +313,7 @@ def closure_makers(root):
                 stack = stack + [n]
             if t and t.startswith("AstStat"):
                 stmts = stmts + [(n, len(stack))]
-            if t == "AstStatWhile" and any(n is d for d in disp_nodes):
+            if _is_dispatch_loop(n) and any(n is d for d in disp_nodes):
                 oi = max(i for i, f in enumerate(stack) if len(f["args"]) >= 2)
                 if oi + 1 < len(stack):
                     clo = stack[oi + 1]
@@ -310,8 +345,22 @@ def unwrap_group(e):
         e = e.get("expr")
     return e
 
+def _reaches(fn, disp_nodes):
+    """Does this function body contain (or lead to) one of the dispatch loops?"""
+    ids = {id(d) for d in disp_nodes}
+    hit = []
+
+    def visit(n):
+        if hit:
+            return
+        if isinstance(n, dict) and id(n) in ids:
+            hit.append(n)
+    walk(fn, visit)
+    return bool(hit)
+
 def maker_info(root, disp=None):
-    disp_nodes = {id(d["node"]) for d in (disp if disp is not None else find_dispatchers(root))}
+    disp_nodes = [d["node"] for d in (disp if disp is not None else find_dispatchers(root))]
+    disp_ids = {id(n) for n in disp_nodes}
     out = {}
 
     def walk_tree(n, stack, stmts):
@@ -325,25 +374,69 @@ def maker_info(root, disp=None):
             elif t and t.startswith("AstStat"):
                 stmts.append((n, len(stack)))
                 pushed_stmt = True
-            if t == "AstStatWhile" and id(n) in disp_nodes:
+            if t and t.startswith("AstStat") and id(n) in disp_ids:
                 oi = max((i for i, f in enumerate(stack) if len(f["args"]) >= 2), default=-1)
-                if oi != -1 and oi + 1 < len(stack):
-                    clo = stack[oi + 1]
-                    st = [s for s, d in stmts if d == oi + 1]
-                    st = st[-1] if st else None
-                    if st and st["type"] == "AstStatAssign":
+
+                # The VM closure is not always the function directly inside the maker.
+                # v15.0 puts it there (maker -> closure -> dispatch); v15.1 inserts a
+                # wrapper that only rebinds the state table, so the closure is one level
+                # deeper. Prefer the adjacent slot -- the shape every working sample has
+                # -- and only walk further when it does not reach a dispatch loop.
+                clo, clo_depth = None, -1
+                if oi != -1 and oi + 1 < len(stack) and _reaches(stack[oi + 1], disp_nodes):
+                    clo, clo_depth = stack[oi + 1], oi + 1
+                elif oi != -1:
+                    for ci in range(oi + 1, len(stack)):
+                        if _reaches(stack[ci], disp_nodes):
+                            clo, clo_depth = stack[ci], ci
+                            break
+
+                if oi != -1 and clo is not None and clo_depth > oi:
+                    # The assigning statement's depth is not fixed: v15.0 writes
+                    # `local I,a = ...` in the maker's body (one level in), v15.1 writes
+                    # `AuU[121] = ...` around it. Take the assign whose product *is* the
+                    # maker function, and fall back to the fixed offset.
+                    maker_stmts = [s for s, d in stmts if d == clo_depth]
+                    enclosed = []
+                    for s, _d in stmts:
+                        if s["type"] != "AstStatAssign":
+                            continue
+                        hit = []
+
+                        def visit(x):
+                            if x is stack[oi]:
+                                hit.append(x)
+                        walk(s, visit)
+                        if hit:
+                            enclosed.append(s)
+                    st = maker_stmts[-1] if maker_stmts and maker_stmts[-1]["type"] == "AstStatAssign" \
+                        else (enclosed[-1] if enclosed else None)
+                    if st:
                         for v, e in zip(st["vars"], st["values"]):
                             e = unwrap_group(e)
-                            if e is clo and local_name(v):
-                                _, _, l2, c2 = loc(st)
-                                if (l2, c2) not in out:
-                                    pi, ui = _maker_params(stack[oi])
-                                    out[(l2, c2)] = {"at": (l2, c2), "var": local_name(v),
-                                                     "proto": stack[oi]["args"][pi]["name"],
-                                                     "proto_index": pi, "upvals_index": ui,
+                            # v15.1 wraps the entry in one more function, so the value
+                            # stored is either the dispatch-bearing closure (v15.0) or the
+                            # maker that produces it.
+                            if e is not clo and e is not stack[oi]:
+                                continue
+                            # v15.0 binds the VM closure to a local (`local f = function`).
+                            # v15.1 stores every entry on one table (`AuU[121] = ...`), so
+                            # the target is an index expression and local_name is null for
+                            # it; the slot name is what the hook has to use.
+                            target = local_name(v)
+                            if not target and v.get("type") == "AstExprIndexExpr":
+                                target = local_name(v["index"]) or local_name(v["expr"])
+                            if not target:
+                                continue
+                            _, _, l2, c2 = loc(st)
+                            if (l2, c2) not in out:
+                                pi, ui = _maker_params(stack[oi])
+                                out[(l2, c2)] = {"at": (l2, c2), "var": target,
+                                                 "proto": stack[oi]["args"][pi]["name"],
+                                                 "proto_index": pi, "upvals_index": ui,
 
-                                                     "pf_key": stack[oi]["args"][pi]["name"],
-                                                     "maker": stack[oi], "vm": clo, "stmt": st}
+                                                 "pf_key": stack[oi]["args"][pi]["name"],
+                                                 "maker": stack[oi], "vm": clo, "stmt": st}
             for v in n.values():
                 walk_tree(v, stack, stmts)
             if pushed_stack:
